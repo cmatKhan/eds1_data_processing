@@ -1,0 +1,401 @@
+---
+title: "EDS1 Experiment and Data"
+author: Chase Mateusiak, chasem@wustl.edu
+date: "`r Sys.Date()`"
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(dirname(inputFile), "../docs", 'index.html')) })
+output: 
+  html_document
+---
+
+```{r notebook_setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  echo = FALSE,
+  include = FALSE
+)
+```
+
+```{r setup}
+library(DESeq2)
+library(tidyverse)
+library(ggExtra)
+library(here)
+
+WRITE = FALSE
+```
+
+```{r load data, cache=TRUE}
+multiqc_df = read_csv(here("data/multiqc.csv"))
+
+biotypes_df = read_csv(here("data/biotypes_df.csv"))
+
+expr_df = read_csv(here("data/coverage_log2cpm.csv"))
+
+sample_df = read_csv(here("data/eds1_yeast_metadata_with_nf_sampleid.csv")) %>%
+  mutate(carbonSourcePercent = 
+           ifelse(carbonSource == "none", NA, carbonSourcePercent))
+
+status_df = read_csv(here("data/sample_status.csv"))
+
+quant_paths = readRDS(here("data/eds_quant_lookup.rds"))
+# txi = tximport(
+#   quant_paths,
+#   type = "salmon",
+#   tx2gene = read_tsv("/mnt/htcf_scratch/chasem/eds1/results/star_salmon/salmon_tx2gene.tsv")
+# )
+
+# write_rds(txi, "../data/chemostat_rnaseq/txi.rds")
+
+txi_colnames = unlist(map(quant_paths, ~basename(str_remove(., "/quant.sf"))))
+txi = readRDS(here("data/txi.rds"))
+colnames(txi$abundance) = txi_colnames
+colnames(txi$counts) = txi_colnames
+colnames(txi$length) = txi_colnames
+
+coldat = tibble(sample = txi_colnames) %>%
+  left_join(sample_df) %>% 
+  left_join(status_df)
+
+stopifnot(coldat$sample == colnames(txi$counts))
+
+dds = DESeqDataSetFromTximport(
+  txi = txi,
+  colData = coldat,
+  design = ~1
+)
+
+```
+
+# Primary Questions
+
+ 1. In what conditions is EDS1 expressed?
+ 2. What is EDS1 regulated by?
+ 3. What does EDS1 regulate?
+ 4. How does EDS1 relate to RGT1?
+ 5. What phenotypes associated with RGT1 deletion? (see SGD)
+ 6. (possible) RGT1/EDS1 change/divergence over time has lead to differentiated 
+ function and therefore retention
+
+## Hypotheses
+
+ - EDS1 responds to limited glucose conditions
+ - EDS1 expression is (depedent? related to?) snf1
+ - EDS1 has a role in the lysine pathway
+ - EDS1 regulates HXT and other genes regulated by RGT1/MIG1
+ - protein-protein interactions (sources: string, biogrid -- see SGD for this, easy to click around)
+ - cell map -- which other genes have interactions with EDS1 (may also be avail through biogrid). otherway: take two genes, compute distance between interaction vectors. Do they tend to interact with some other gene?
+
+
+# RNAseq
+
+## QC Metrics and Thresholds
+
+Metric                     | Threshold | Status
+-------------------------- | --------- | ---
+mRNA total                 | 1e6       | 1
+mRNA percent               | 75        | 2
+Not Aligned Total Percent  | 7         | 4
+Deleted locus coverage     | .25       | 8
+Deleted locus log2(norm+1) |           | 
+Marker expression?         |           | 
+
+### Chemostat sample distributions
+
+#### mRNA Total Distribution
+
+```{r mRNA total dist, include=TRUE, cache=TRUE}
+
+biotypes_df %>%
+  distinct(sample, .keep_all = TRUE) %>%
+  filter(!is.na(mRNA)) %>%
+ggplot() + 
+  geom_histogram(aes(log2(mRNA)), bins = 40) + 
+  geom_vline(xintercept = log2(1e6), color = "red") + 
+  ggtitle("Distribution of mRNA reads by sample, log2 scale",
+    subtitle = "Threshold: 1e6")
+
+```
+
+#### mRNA Percent Distribution
+
+This reflects mRNA as a percent of uniquely mapped reads. Note the bimodal nature 
+of the distribution. I do not yet have an explanation.
+
+```{r mRNA percent dist, include=TRUE, cache=TRUE}
+
+biotypes_df %>%
+  distinct(sample, .keep_all = TRUE) %>%
+  filter(!is.na(mRNA_percent)) %>%
+ggplot() + 
+  geom_histogram(aes(mRNA_percent), bins = 40) + 
+  geom_vline(xintercept = 76, color = "blue", linetype = "dotted") + 
+  ggtitle("Distribution of mRNA reads as a percent of uniquely aligned reads",
+    subtitle = "Threshold: 75%")
+
+```
+
+#### Not aligned total percent
+
+```{r}
+multiqc_df %>% 
+  filter(trimmed == TRUE) %>% 
+  select(general.unmapped_mismatches_percent, 
+         general.unmapped_tooshort_percent, 
+         general.unmapped_other_percent) %>% 
+  mutate(unmapped_percent = rowSums(across(where(is.numeric)))) %>%
+ggplot() + 
+  geom_jitter(aes("",unmapped_percent, color = unmapped_percent > 40), height = 0)+
+  ggtitle("Distribution of unmapped percent, no filtering. Note outliers at >40%")
+```
+```{r}
+multiqc_df %>% 
+  filter(trimmed == TRUE) %>% 
+  select(general.unmapped_mismatches_percent, 
+         general.unmapped_tooshort_percent, 
+         general.unmapped_other_percent) %>% 
+  mutate(unmapped_percent = rowSums(across(where(is.numeric)))) %>%
+  filter(unmapped_percent < 20) %>%
+ggplot() + 
+  geom_histogram(aes(unmapped_percent)) +
+  geom_vline(xintercept = 7, color = 'red') +
+  ggtitle("Distribution of unmapped percent, filtered to <7% unmapped",
+          subtitle = "Threshold: 7%")
+```
+
+
+#### Deleted coverage vs log2(norm)
+
+NOTE: points __are not__ samples. A sample with 4 KO loci is represented as 
+four points on the plots.
+
+The x-axis represents coverage across the deleted gene CDS, and the y-axis 
+represents expression, on a log2 scale. Expression has been scaled by library 
+size, and transcript length normalized.
+
+```{r cov dist, include=TRUE, cache=TRUE}
+
+expr_df %>%
+  filter(!is.na(locus_coverage), perturbation == "deletion") %>%
+ggplot() + 
+  geom_histogram(aes(locus_coverage)) + 
+  geom_vline(xintercept = .25, color = "red") + 
+  ggtitle("Coverage histogram",
+    subtitle = 
+      paste0("Threshold: .25 coverage over CDS\n"))
+
+```
+
+
+```{r coverage dist, include=TRUE, cache=TRUE}
+
+expr_fltr = expr_df %>%
+  filter(!is.na(locus_coverage), perturbation == "deletion")
+
+p =  expr_fltr %>%
+ggplot() + 
+  geom_jitter(aes(locus_coverage, log2_length_scaled)) + 
+  geom_vline(xintercept = .25, color = "red") + 
+  geom_hline(yintercept = 2.5, color = 'blue', linetype = "dotted") +
+  ggtitle("Coverage vs log2(norm+1) expression",
+    subtitle = 
+      paste0("Threshold: .25 coverage over CDS\n",
+             "blue dotted at log2_length_scaled 2.5, identifying 1 sample for manual review"))
+
+ggMarginal(p, type = "histogram")
+
+```
+
+Note that despite what it appears on the plot, there are only 84 samples above 
+the .25 threshold, and 507 samples below the threshold. The points below the 
+threshold simply stack on top of one another.
+
+## Replicate Tally
+
+```{r create tally, include=FALSE, echo=FALSE}
+    
+
+conditions_group = status_df %>%
+  left_join(sample_df) %>%
+  group_by(media, aminoAcid, carbonSource, carbonSourcePercent, temperature, atmosphere, treatment, treatmentConc, timePoint) %>%
+  group_split()
+
+getGroupSplitNames = function(grouped_df){
+  grouped_df %>%
+    select(media, aminoAcid, carbonSource, carbonSourcePercent, temperature, atmosphere, treatment, treatmentConc, timePoint) %>%
+    unite("sample_condition", media:timePoint, sep="_") %>%
+    pull(sample_condition) %>%
+    unique()
+}
+
+condition_names = unlist(map(conditions_group, getGroupSplitNames))
+condition_names = str_replace_all(str_remove_all(condition_names, "NA|none"), "__+", "_")
+
+tally_by_genotype = function(grouped_df){
+  grouped_df %>%
+    group_by(genotype) %>%
+    summarise(n = n())
+}
+
+geno_tally_by_condition = map(conditions_group, tally_by_genotype)
+
+names(geno_tally_by_condition) = condition_names
+
+tally_df = as_tibble(matrix(nrow=40, ncol = 17))
+
+colnames(tally_df) = c('condition', sort(unique(bind_rows(geno_tally_by_condition)$genotype)))
+tally_df$condition = sort(condition_names)
+
+tally_df$condition = condition_names
+
+for(condition in condition_names){
+  
+    geno_tally = geno_tally_by_condition[[condition]]
+  
+  for(geno in geno_tally$genotype){
+
+    tally_df[tally_df$condition == condition, geno] =
+      as.numeric(geno_tally[geno_tally$genotype == geno, 'n'])
+  }
+}
+```
+
+
+```{r lib quality passing, include=FALSE, echo=FALSE, cache=TRUE}
+
+chemostat_tally = function(df_status){
+  
+  conditions_group = df_status %>%
+    filter(statusDecomp == 'passing_sample')%>%
+    left_join(sample_df) %>%
+    group_by(media, aminoAcid, carbonSource, carbonSourcePercent, temperature, atmosphere, treatment, treatmentConc, timePoint) %>%
+    group_split()
+  
+  getGroupSplitNames = function(grouped_df){
+    grouped_df %>%
+      select(media, aminoAcid, carbonSource, carbonSourcePercent, temperature, atmosphere, treatment, treatmentConc, timePoint) %>%
+      unite("sample_condition", media:timePoint, sep="_") %>%
+      pull(sample_condition) %>%
+      unique()
+  }
+  
+  condition_names = unlist(map(conditions_group, getGroupSplitNames))
+  condition_names = str_replace_all(str_remove_all(condition_names, "NA|none"), "__+", "_")
+  
+  tally_by_genotype = function(grouped_df){
+    grouped_df %>%
+      group_by(genotype) %>%
+      summarise(n = n())
+  }
+  
+  geno_tally_by_condition = map(conditions_group, tally_by_genotype)
+  
+  names(geno_tally_by_condition) = condition_names
+  
+  tally_df = as_tibble(matrix(nrow=length(condition_names), ncol = length(sort(unique(bind_rows(geno_tally_by_condition)$genotype)))))
+  
+  colnames(tally_df) = c('condition',
+                         sort(unique(bind_rows(geno_tally_by_condition)$genotype)))
+  tally_df$condition = sort(condition_names)
+
+  tally_df$condition = condition_names
+
+  for(condition in condition_names){
+
+      geno_tally = geno_tally_by_condition[[condition]]
+
+    for(geno in geno_tally$genotype){
+
+      tally_df[tally_df$condition == condition, geno] =
+        as.numeric(geno_tally[geno_tally$genotype == geno, 'n'])
+    }
+  }
+  tally_df
+}
+
+lib_qual_passing = sample_df %>%
+  left_join(status_df) %>%
+  filter(statusDecomp == 'passing_sample')
+
+lib_qual_passing_tally = chemostat_tally(lib_qual_passing)
+```
+
+```{r}
+colnames(lib_qual_passing_tally)[2:ncol(lib_qual_passing_tally)] = 
+  paste0(colnames(lib_qual_passing_tally)[2:ncol(lib_qual_passing_tally)], "_qc1")
+full_tally = tally_df %>% left_join(lib_qual_passing_tally)
+
+full_tally = full_tally %>%
+  select(all_of(sort(colnames(full_tally))))
+```
+```{r lib qual passing tally, include = TRUE, echo = TRUE, cache=TRUE}
+DT::datatable(full_tally)
+```
+
+
+```{r create analysis objs}
+
+# split data sets
+
+dds_list = list(
+  
+  mimic_cc_dds     = dds[,dds$experimentDesign == 'mimic_cc' & 
+                          dds$media != "YPD" &
+                          dds$statusDecomp == "passing_sample" ],
+  
+  chemostat_tc_dds = dds[,dds$experimentDesign == "chemostat" &
+                          dds$carbonSource == "Glucose" &
+                          dds$statusDecomp == 'passing_sample'],
+  
+  chemostat_gal_dds = cbind(
+                     dds[,dds$experimentDesign == "chemostat" &
+                          dds$carbonSource == "Galactose" &
+                          dds$statusDecomp == 'passing_sample'],
+                     dds[,dds$experimentDesign == "chemostat" &
+                          dds$media == "YPD" &
+                          dds$statusDecomp == 'passing_sample']
+  )
+  
+)
+
+if(WRITE==TRUE){
+  map(names(dds_list), ~saveRDS(dds_list[[.]], file.path(here('data/analysis_objs'), paste0(.,'.rds'))))
+}
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
